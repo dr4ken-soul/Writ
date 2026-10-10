@@ -1,0 +1,40 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Build output
+dist/
+build/
+.next/
+out/
+*.tsbuildinfo
+
+# Compact compiler output. Regenerate with `npm run compact`; the generated
+# managed directory is large and is not the source of truth.
+contracts/src/managed/
+contracts/dist/
+
+# Environment. The sealed mandate never leaves a device, and neither do keys.
+.env
+.env.local
+.env*.local
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+*.log
+
+# Editors and OS
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+
+# Test output
+coverage/
+
+# Vercel
+.vercel

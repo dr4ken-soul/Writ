@@ -1,0 +1,37 @@
+{
+  "name": "@writ/sdk",
+  "version": "0.1.0",
+  "description": "The integration surface for Writ: issue, act, attest, revoke, status",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "rm -rf dist && tsc --project tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "ci": "npm run typecheck && npm run test && npm run build"
+  },
+  "keywords": [
+    "midnight",
+    "compact",
+    "ai-agents",
+    "privacy",
+    "writ"
+  ],
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "typescript": "^5.9.3",
+    "vitest": "^2.1.9"
+  }
+}

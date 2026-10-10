@@ -1,0 +1,450 @@
+// This file is part of Writ.
+// Copyright (C) 2026 Writ contributors
+// SPDX-License-Identifier: Apache-2.0
+//
+// WritRegistry: the private mandate layer for AI agents on Midnight.
+//
+// A principal seals mandate terms (ceiling, time window, allowlist, action
+// mask) into private state before any transaction is built. This contract
+// records only a commitment to those terms, a pseudonymous principal
+// reference, an expiry and a status.
+//
+// What an observer of the public ledger can learn, step by step:
+//   issueWrit   -> that a writ exists, its commitment, its status, its expiry
+//                  and its disclosure level. Never the terms.
+//   checkAction -> that an action was attempted, which writ it belongs to, and
+//                  whether it was in scope. Never which bound stopped it.
+//   attest      -> that a disclosure happened and to whom. Never the terms.
+//   revoke      -> that the writ was revoked. Nothing else.
+//
+// The mandate terms themselves never enter a ledger write, an event, an error
+// message or a return value. Every circuit below carries a comment stating what
+// it must never disclose.
+
+pragma language_version 0.23;
+
+import CompactStandardLibrary;
+
+// --- Public state -----------------------------------------------------------
+// Every `ledger` field is on-chain and readable by anyone who looks. The rule
+// this contract exists to enforce is that none of these fields may ever hold a
+// ceiling, a window, an allowlist entry or an action mask.
+
+// The lifecycle of a writ. Blueprint: Sealed, Active, Rejected, Revoked,
+// Disclosed.
+export enum WritStatus {
+  SEALED,
+  ACTIVE,
+  REJECTED,
+  REVOKED,
+  DISCLOSED
+}
+
+// writ id -> commitment to the sealed terms.
+export ledger commitments: Map<Bytes<32>, Bytes<32>>;
+
+// writ id -> status.
+export ledger statuses: Map<Bytes<32>, WritStatus>;
+
+// writ id -> pseudonymous principal reference. A hash bound to this contract
+// address, never a wallet key and never the principal's secret.
+export ledger principals: Map<Bytes<32>, Bytes<32>>;
+
+// writ id -> expiry as unix seconds.
+export ledger expiries: Map<Bytes<32>, Uint<64>>;
+
+// writ id -> the disclosure ceiling fixed when the writ was issued, as 0 for
+// none, 1 for boolean only, 2 for band approved.
+//
+// This is the one piece of policy metadata that is public, and deliberately so.
+// `attest` is called by a verifier who does not hold the principal's private
+// state, so the circuit needs the level in order to enforce the ceiling without
+// asking the principal for anything. The level reveals how much may be
+// disclosed, never what the terms are.
+export ledger disclosureLevels: Map<Bytes<32>, Uint<8>>;
+
+// action id -> writ id. Action ids are pseudonymous hashes handed to the
+// counterparty, so this map cannot be enumerated from the chain.
+export ledger actionWrits: Map<Bytes<32>, Bytes<32>>;
+
+// action id -> 0 when the action was in scope, 1 when it was rejected.
+export ledger actionVerdicts: Map<Bytes<32>, Uint<8>>;
+
+// action id -> spend band, 0 to 3. The band is derived from the private
+// ceiling, so publishing a band does not publish the ceiling.
+export ledger actionBands: Map<Bytes<32>, Uint<8>>;
+
+// Number of writs issued. Public counter read by the landing page metrics.
+export ledger writCount: Uint<64>;
+
+// Number of actions checked and found in scope. Public counter. It proves a
+// count, never an amount and never which action.
+export ledger inScopeCount: Uint<64>;
+
+// Serial number used to give every action a distinct identifier.
+export ledger actionCount: Uint<64>;
+
+// Running root of the append only disclosure log.
+export ledger auditRoot: Bytes<32>;
+
+// Number of entries in the disclosure log.
+export ledger auditCount: Uint<64>;
+
+// --- Private input ----------------------------------------------------------
+// Witnesses run on the caller's machine. The compiler refuses to let any of
+// these reach the ledger unless the circuit wraps it in disclose().
+
+/// Principal private state.
+
+// The principal's secret key. Never disclosed, only ever hashed.
+witness principalSecretKey(): Bytes<32>;
+
+// The sealed terms of the writ currently being acted on.
+witness sealedCeiling(): Uint<64>;
+witness sealedWindowStart(): Uint<64>;
+witness sealedWindowEnd(): Uint<64>;
+witness sealedAllowlist(): Vector<8, Bytes<32>>;
+witness sealedActionMask(): Uint<8>;
+witness sealedDisclosureLevel(): Uint<8>;
+
+/// Agent private state.
+
+// The agent's secret key, used to derive a distinct action id per action.
+witness agentSecretKey(): Bytes<32>;
+
+/// Verifier private state.
+
+// The verifier's secret key. Only ever hashed, used to attribute a disclosure
+// request in the audit log.
+witness verifierSecretKey(): Bytes<32>;
+
+/// Shared witnesses.
+
+// Current unix time in seconds, read from the chain by the witness. Never
+// disclosed: the circuit compares it against the private window and only the
+// resulting verdict is published.
+witness currentTimestamp(): Uint<64>;
+
+constructor() {
+  // The audit log starts from a fixed non zero value so that a fresh
+  // deployment has a well defined empty root that cannot be confused with an
+  // uninitialised ledger.
+  auditRoot = disclose(pad(32, "writ:audit:root:"));
+  writCount = disclose(0 as Uint<64>);
+  inScopeCount = disclose(0 as Uint<64>);
+  actionCount = disclose(0 as Uint<64>);
+  auditCount = disclose(0 as Uint<64>);
+}
+
+// Derives a 32 byte value bound to (purpose, this contract address, secret).
+// persistentHash rather than transientHash because writ ids, action ids and
+// principal references are stored on the ledger and must be recomputed
+// identically in later transactions. Binding kernel.self().bytes means the same
+// secret yields unrelated values in any other contract, so a principal cannot
+// be linked across deployments.
+circuit derive(purpose: Bytes<32>, secret: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<3, Bytes<32>>>([purpose, kernel.self().bytes, secret]);
+}
+
+// True when `entry` appears in the sealed allowlist. The comparison runs inside
+// the proof. Nothing about the allowlist leaves this function, and the returned
+// boolean is never written to the ledger on its own.
+circuit allowlistContains(entry: Bytes<32>, list: Vector<8, Bytes<32>>): Boolean {
+  var index = 0;
+  var found = false;
+  while (index < 8) {
+    found = found || list[index] == entry;
+    index = index + 1;
+  }
+  return found;
+}
+
+// Maps an amount onto one of four spend bands using the private ceiling. The
+// ceiling is an input and never an output, so publishing the band does not
+// publish the ceiling. The band is coarse on purpose.
+circuit bandOf(amount: Uint<64>, ceiling: Uint<64>): Uint<8> {
+  const quarter = ceiling / 4;
+  const half = ceiling / 2;
+  const threeQuarters = (ceiling * 3) / 4;
+  if (amount <= quarter) {
+    return 0;
+  }
+  if (amount <= half) {
+    return 1;
+  }
+  if (amount <= threeQuarters) {
+    return 2;
+  }
+  return 3;
+}
+
+// Boolean to Uint<8> without relying on a field cast, so the verdict encoding
+// is explicit and readable.
+circuit boolToUint(flag: Boolean): Uint<8> {
+  if (flag) {
+    return 1;
+  }
+  return 0;
+}
+
+/// Reason codes. These are the values the agent wallet receives as the circuit
+/// return value. They are never written to the ledger, never attached to an
+/// error message that leaves the agent and never surfaced to a verifier.
+
+// 0 in scope
+// 1 amount above the sealed ceiling
+// 2 recipient not on the sealed allowlist
+// 3 outside the sealed time window
+// 4 intent bit not set in the sealed action mask
+// 5 the writ is not in a state that permits acting
+circuit reasonCode(amountOk: Boolean, toOk: Boolean, timeOk: Boolean, intentOk: Boolean, writActive: Boolean): Uint<8> {
+  if (!writActive) {
+    return 5;
+  }
+  if (!amountOk) {
+    return 1;
+  }
+  if (!toOk) {
+    return 2;
+  }
+  if (!timeOk) {
+    return 3;
+  }
+  if (!intentOk) {
+    return 4;
+  }
+  return 0;
+}
+
+// The single fact disclosed at level 1: whether the action was within the writ.
+circuit booleanFact(verdict: Uint<8>): Opaque<"string"> {
+  if (verdict != 0) {
+    return Opaque<"string">("rejected");
+  }
+  return Opaque<"string">("within-writ");
+}
+
+// The single fact disclosed at level 2: the coarse spend band. Not the amount
+// and not the ceiling.
+circuit bandFact(band: Uint<8>): Opaque<"string"> {
+  if (band == 1) {
+    return Opaque<"string">("tier-1");
+  }
+  if (band == 2) {
+    return Opaque<"string">("tier-2");
+  }
+  if (band == 3) {
+    return Opaque<"string">("tier-3");
+  }
+  return Opaque<"string">("tier-0");
+}
+
+// --- Public circuits --------------------------------------------------------
+
+/// ISSUE
+/// Records the commitment to a sealed mandate and opens the writ.
+///
+/// Must never disclose: the ceiling, the window, the allowlist, the action
+/// mask, the principal's secret key, or how many allowlist entries are in use.
+/// The only policy value that leaves this circuit is the disclosure level,
+/// because attest has to enforce it without the principal present.
+
+export circuit issueWrit(expiry: Uint<64>): Bytes<32> {
+  const secret = principalSecretKey();
+
+  // The writ id is a hash, disclosed so it can be used as a map key. The secret
+  // itself is never disclosed and is not recoverable from the hash.
+  const writId = disclose(derive(pad(32, "writ:id:"), secret));
+
+  assert(!commitments.member(writId), "This principal has already issued this writ");
+  assert(expiry > currentTimestamp(), "The expiry must be in the future");
+
+  // Salt for the commitment, derived from the principal's own secret so it is
+  // never disclosed. Determinism is safe here because a principal issues each
+  // writ exactly once, which the member() check above enforces. A contract that
+  // commits repeatedly for one principal would need fresh randomness each time.
+  const salt = derive(pad(32, "writ:salt:"), secret);
+
+  // Hash the terms, then commit to that hash. The two step keeps the salt out of
+  // the hashed material, and committing last means a guessable ceiling cannot
+  // be recovered by hashing candidate values.
+  const list = sealedAllowlist();
+  const allowlistHash = persistentHash<Vector<8, Bytes<32>>>(
+    [list[0], list[1], list[2], list[3], list[4], list[5], list[6], list[7]]
+  );
+
+  const terms = persistentHash<Vector<5, Bytes<32>>>([
+    (sealedCeiling() as Field as Bytes<32>),
+    (sealedWindowStart() as Field as Bytes<32>),
+    (sealedWindowEnd() as Field as Bytes<32>),
+    allowlistHash,
+    (sealedActionMask() as Field as Bytes<32>)
+  ]);
+
+  commitments.insert(writId, persistentCommit<Bytes<32>>(terms, salt));
+
+  // Recomputed rather than taken from a witness, so the value recorded here is
+  // bound to the same secret as the writ id.
+  principals.insert(writId, disclose(derive(pad(32, "writ:principal:"), secret)));
+  expiries.insert(writId, disclose(expiry));
+  statuses.insert(writId, disclose(WritStatus.SEALED));
+
+  // The disclosure ceiling is fixed here, at issuance, and can never be raised
+  // afterwards: no other circuit writes disclosureLevels.
+  disclosureLevels.insert(writId, disclose(sealedDisclosureLevel()));
+
+  writCount = disclose(writCount + 1);
+
+  return writId;
+}
+
+/// ACT
+/// Checks one agent action against the sealed terms and returns a sealed
+/// verdict to the calling agent wallet.
+///
+/// Must never disclose: which bound failed, the ceiling, the window, the
+/// allowlist, the action mask, or the exact amount. The public effect of this
+/// circuit is a status change and an action record carrying a verdict and a
+/// coarse band, nothing more.
+
+export circuit checkAction(
+  writ: Bytes<32>,
+  to: Bytes<32>,
+  amount: Uint<64>,
+  intent: Uint<8>
+): Uint<8> {
+  assert(commitments.member(writ), "Unknown writ");
+
+  const ceiling = sealedCeiling();
+  const windowStart = sealedWindowStart();
+  const windowEnd = sealedWindowEnd();
+  const allowlist = sealedAllowlist();
+  const actionMask = sealedActionMask();
+
+  const now = currentTimestamp();
+
+  // Every comparison below runs inside the proof. Only the resulting verdict
+  // is ever published.
+  const amountOk = amount <= ceiling;
+  const toOk = allowlistContains(to, allowlist);
+  const timeOk = now >= windowStart && now <= windowEnd && now <= expiries.lookup(writ);
+  const intentOk = (actionMask & intent) == intent;
+
+  const status = statuses.lookup(writ);
+  const writActive = status == WritStatus.SEALED || status == WritStatus.ACTIVE;
+
+  const code = reasonCode(amountOk, toOk, timeOk, intentOk, writActive);
+  const inScope = code == 0;
+
+  // A distinct action id per action, derived from the agent key so two agents
+  // cannot collide and so an agent cannot forge another agent's action.
+  const serial = persistentHash<Vector<2, Bytes<32>>>([
+    agentSecretKey(),
+    (actionCount as Field as Bytes<32>)
+  ]);
+  const actionId = disclose(derive(pad(32, "writ:action:"), serial));
+  actionCount = disclose(actionCount + 1);
+
+  actionWrits.insert(actionId, writ);
+  actionVerdicts.insert(actionId, disclose(boolToUint(inScope)));
+  actionBands.insert(actionId, disclose(bandOf(amount, ceiling)));
+
+  if (inScope) {
+    statuses.insert(writ, disclose(WritStatus.ACTIVE));
+    inScopeCount = disclose(inScopeCount + 1);
+  } else {
+    statuses.insert(writ, disclose(WritStatus.REJECTED));
+  }
+
+  // The reason code is this circuit's return value. In Compact a return value
+  // goes to the calling wallet and is not part of the public transaction, so
+  // this is the only path by which a reason code travels and it terminates at
+  // the agent.
+  return code;
+}
+
+/// DISCLOSE
+/// Contract controlled disclosure of exactly one scoped fact about one action,
+/// to the verifier who called. The level is checked against the level fixed at
+/// issuance, so a verifier cannot ask for more than the policy allows.
+///
+/// Must never disclose: the ceiling, the window, the allowlist, the action
+/// mask, or any second fact in the same call.
+
+export circuit attest(action: Bytes<32>, level: Uint<8>): Opaque<"string"> {
+  assert(actionWrits.member(action), "Unknown action");
+
+  const writ = actionWrits.lookup(action);
+  const ceilingLevel = disclosureLevels.lookup(writ);
+
+  // Reverted rather than silently downgraded, and the error names no value, so
+  // a verifier who asks for more than policy allows learns nothing, not even
+  // how far above the policy they reached.
+  assert(level > 0, "This writ carries no disclosure policy");
+  assert(level <= ceilingLevel, "Disclosure level exceeds the level fixed at issuance");
+
+  const fact = selectFact(actionVerdicts.lookup(action), actionBands.lookup(action), level);
+
+  // Append to the disclosure log. The entry binds the previous root, the
+  // verifier's pseudonymous reference and the action, so the log proves that a
+  // disclosure happened and who asked for it without recording what was
+  // disclosed.
+  const verifier = disclose(derive(pad(32, "writ:verifier:"), verifierSecretKey()));
+  auditRoot = disclose(persistentHash<Vector<4, Bytes<32>>>(
+    [pad(32, "writ:audit:entry:"), auditRoot, verifier, action]
+  ));
+  auditCount = disclose(auditCount + 1);
+  statuses.insert(writ, disclose(WritStatus.DISCLOSED));
+
+  // Exactly one fact, returned only to this caller.
+  return fact;
+}
+
+// Chooses which single fact to disclose. Exactly one branch runs and exactly one
+// value is produced.
+circuit selectFact(verdict: Uint<8>, band: Uint<8>, level: Uint<8>): Opaque<"string"> {
+  if (level == 1) {
+    return booleanFact(verdict);
+  }
+  return bandFact(band);
+}
+
+/// REVOKE
+/// Changes the status and nothing else.
+///
+/// Must never disclose: the terms, and no fact about why the writ is revoked.
+
+export circuit revoke(writ: Bytes<32>): [] {
+  const secret = principalSecretKey();
+  assert(commitments.member(writ), "Unknown writ");
+  assert(principals.lookup(writ) == derive(pad(32, "writ:principal:"), secret),
+    "Only the issuing principal may revoke this writ");
+  statuses.insert(writ, disclose(WritStatus.REVOKED));
+}
+
+/// READ
+/// Public read of the commitment for a writ. Never returns terms. Callers that
+/// hold the writ compare it against their own sealed copy to confirm identity.
+
+export circuit statusOf(writ: Bytes<32>): Bytes<32> {
+  assert(commitments.member(writ), "Unknown writ");
+  return commitments.lookup(writ);
+}
+
+/// READ
+/// Public read of the running disclosure log root.
+
+export circuit auditRootOf(): Bytes<32> {
+  return auditRoot;
+}
+
+/// READ
+/// Public counters backing the landing page metrics.
+
+export circuit writCountOf(): Uint<64> {
+  return writCount;
+}
+
+export circuit inScopeCountOf(): Uint<64> {
+  return inScopeCount;
+}

@@ -1,0 +1,100 @@
+// This file is part of Writ.
+// Copyright (C) 2026 Writ contributors
+// SPDX-License-Identifier: Apache-2.0
+//
+// AuditLog: an append only accumulator for disclosure events.
+//
+// WritRegistry maintains its own disclosure log so that the mandate lifecycle
+// stays in one contract. AuditLog is the standalone, reusable log that any
+// Writ integration can point at: it accepts one entry hash at a time, chains
+// every entry to the previous root and publishes the running root.
+//
+// What an observer of the public ledger can learn:
+//   append  -> that an entry was appended, its hash, its submitter reference
+//              and the new root. Never what the entry means.
+//   root    -> the current root. Enough to prove inclusion, nothing more.
+//
+// Entries are hashes. The log records that a disclosure happened, never what
+// was disclosed. Reading an entry back requires already holding its hash, which
+// only the participants of the disclosure have.
+
+pragma language_version 0.23;
+
+import CompactStandardLibrary;
+
+// Entry index -> entry hash. Append only: nothing in this contract removes or
+// overwrites an entry.
+export ledger entries: Map<Uint<64>, Bytes<32>>;
+
+// Entry index -> submitter reference, a hash bound to this contract address.
+export ledger submitters: Map<Uint<64>, Bytes<32>>;
+
+// Running chain root over every entry appended so far.
+export ledger root: Bytes<32>;
+
+// Number of entries appended so far.
+export ledger count: Uint<64>;
+
+// --- Private input ----------------------------------------------------------
+
+// The appender's secret key. Never disclosed, only ever hashed.
+witness appenderSecretKey(): Bytes<32>;
+
+constructor() {
+  // A fixed non zero starting root so an empty log cannot be confused with an
+  // uninitialised ledger.
+  root = disclose(pad(32, "writ:auditlog:root:"));
+  count = disclose(0 as Uint<64>);
+}
+
+// Derives a 32 byte value bound to (purpose, this contract address, secret).
+// persistentHash because submitter references are stored on the ledger and must
+// be recomputed identically by a reader who holds the same secret.
+circuit derive(purpose: Bytes<32>, secret: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<3, Bytes<32>>>([purpose, kernel.self().bytes, secret]);
+}
+
+/// APPEND
+/// Appends one entry hash to the log and advances the root.
+///
+/// Must never disclose: the contents of the entry, and the meaning of any entry
+/// previously appended. The caller supplies an already hashed entry, so this
+/// circuit never sees a plaintext fact to leak.
+
+export circuit append(entryHash: Bytes<32>): Bytes<32> {
+  // The entry is stored as supplied. Wrapping it in disclose() records that the
+  // caller intends it to be public, which it already is: it is a hash.
+  const entry = disclose(entryHash);
+  const submitter = disclose(derive(pad(32, "writ:auditlog:submitter:"), appenderSecretKey()));
+
+  entries.insert(count, entry);
+  submitters.insert(count, submitter);
+
+  root = disclose(persistentHash<Vector<3, Bytes<32>>>([root, submitter, entry]));
+  count = disclose(count + 1);
+
+  return root;
+}
+
+/// READ
+/// Public read of the current chain root.
+
+export circuit rootOf(): Bytes<32> {
+  return root;
+}
+
+/// READ
+/// Public read of the entry count.
+
+export circuit countOf(): Uint<64> {
+  return count;
+}
+
+/// READ
+/// Public read of the submitter reference for one entry. Returns a pseudonymous
+/// hash, never a key and never the entry's meaning.
+
+export circuit submitterAt(index: Uint<64>): Bytes<32> {
+  assert(entries.member(index), "No entry at that index");
+  return submitters.lookup(index);
+}
