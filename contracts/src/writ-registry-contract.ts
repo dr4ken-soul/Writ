@@ -5,10 +5,10 @@
 import { CompiledContract } from '@midnight-ntwrk/midnight-js-protocol/compact-js';
 
 export * from './managed/writ-registry/contract/index.js';
-export * from './writ-registry-witnesses';
+export * from './writ-registry-witnesses.js';
 
 import * as CompiledWritRegistry from './managed/writ-registry/contract/index.js';
-import * as Witnesses from './writ-registry-witnesses';
+import * as Witnesses from './writ-registry-witnesses.js';
 
 /**
  * The compiled WritRegistry contract, wired to its witnesses and its compiled

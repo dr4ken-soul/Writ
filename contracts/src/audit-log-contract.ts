@@ -5,10 +5,10 @@
 import { CompiledContract } from '@midnight-ntwrk/midnight-js-protocol/compact-js';
 
 export * from './managed/audit-log/contract/index.js';
-export * from './audit-log-witnesses';
+export * from './audit-log-witnesses.js';
 
 import * as CompiledAuditLog from './managed/audit-log/contract/index.js';
-import * as Witnesses from './audit-log-witnesses';
+import * as Witnesses from './audit-log-witnesses.js';
 
 /**
  * The compiled AuditLog contract, wired to its witnesses and its compiled
