@@ -18,7 +18,7 @@
 // was disclosed. Reading an entry back requires already holding its hash, which
 // only the participants of the disclosure have.
 
-pragma language_version 0.23;
+pragma language_version 0.27.0;
 
 import CompactStandardLibrary;
 
@@ -71,7 +71,7 @@ export circuit append(entryHash: Bytes<32>): Bytes<32> {
   submitters.insert(count, submitter);
 
   root = disclose(persistentHash<Vector<3, Bytes<32>>>([root, submitter, entry]));
-  count = disclose(count + 1);
+  count = disclose((count + 1) as Uint<64>);
 
   return root;
 }
@@ -95,6 +95,7 @@ export circuit countOf(): Uint<64> {
 /// hash, never a key and never the entry's meaning.
 
 export circuit submitterAt(index: Uint<64>): Bytes<32> {
-  assert(entries.member(index), "No entry at that index");
-  return submitters.lookup(index);
+  const indexPublic = disclose(index);
+  assert(entries.member(indexPublic), "No entry at that index");
+  return submitters.lookup(indexPublic);
 }

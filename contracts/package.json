@@ -29,6 +29,7 @@
     "@midnight-ntwrk/midnight-js-protocol": "^4.1.1"
   },
   "devDependencies": {
+    "@midnight-ntwrk/compact-runtime": "^0.20.0",
     "@midnight-ntwrk/midnight-js": "^4.1.1",
     "@types/node": "^20.14.0",
     "typescript": "^5.9.3",

@@ -16,6 +16,7 @@ Public ledger state in `WritRegistry`:
 | `principals` | a hash of the principal key, bound to this contract address | unlinkable across deployments |
 | `expiries` | unix seconds | a bound date, not a bound amount |
 | `disclosureLevels` | 0, 1 or 2 | see below |
+| `agents` | hash of the agent key registered at issuance | pseudonymous, and only the registered agent can act |
 | `actionWrits` | action id to writ id | action ids are pseudonymous and handed to participants |
 | `actionVerdicts` | 0 or 1 | the outcome, never the cause |
 | `actionBands` | 0 to 3 | a coarse band, never an amount |
@@ -77,6 +78,43 @@ told something it was not. The error message names no value, so a verifier who a
 learns nothing, not even how far above the policy they reached.
 
 Every successful call appends to the audit log and advances its root.
+
+### Why the contract returns a code, not a string
+
+`attest` returns a `Uint<8>`, not the fact string. Compact cannot construct an
+`Opaque<"string">` inside a circuit: a string literal typed as `Opaque<"string">` is a
+`Bytes<8>`, and casting between them is rejected. The compiler settled this, not a preference.
+
+So the contract picks one code from a fixed set and the SDK renders the fact:
+
+| Code | Fact |
+|---|---|
+| 0 | `within-writ` |
+| 1 | `rejected` |
+| 2 to 5 | `tier-0` to `tier-3` |
+
+The properties that matter are unaffected. The circuit still decides which value comes back, the
+level is still gated in-circuit, and still exactly one code is produced per call. `toDisclosedFact`
+in `sdk/src/attest.ts` is a total map over a six element set.
+
+---
+
+## Intent is an enum, not a bitfield
+
+The action mask is a bitfield in the SDK and in the console, because that is the better interface
+for a person filling in a form. The contract stores it as one boolean per class, because **Compact
+has no bitwise operators**: `&`, `|`, `/` and `%` are all absent from the grammar, and `var` is
+reserved. `IntentClass` is an enum and `sealedPermits` returns a `Vector<4, Boolean>`, with the
+permission check written as four explicit comparisons.
+
+Two consequences worth knowing:
+
+- the allowlist membership check is unrolled across all eight slots rather than written as a
+  `while` loop, because the loop needed a mutable local binding
+- the spend bands are expressed as multiplications (`amount * 4 <= ceiling`) rather than
+  divisions, for the same reason
+
+Both mirror `bandOf` in the SDK exactly, and a test pins the boundaries.
 
 ---
 
@@ -165,14 +203,23 @@ is scoped to a wallet, and a circuit can only compare against terms that are pre
 private state of the wallet proving the transaction. So for the agent's transaction to be checked
 in-circuit, the sealed terms must be present in the private state of whichever wallet proves it.
 
-The MVP runs principal and agent under one private state. What that does and does not give you:
+**The decision taken:** the MVP runs principal and agent under one private state, and the contract
+now binds the agent explicitly at issuance. `sealedAgentKey` is registered during `issueWrit` and
+`checkAction` refuses any transaction whose agent key does not hash to the registered value. That
+closes the part that was genuinely open: before, anyone holding a writ id could submit an action
+and flip that writ's public status. Now only the registered agent can, and there is a test for
+it.
 
-- **It does give you** the guarantee that matters and that a judge can check: the terms never
-  enter public state, never appear in an event, never appear in an error message, and every
-  action is checked against them inside the proof.
+What this still does and does not give you:
+
+- **It does give you** everything a judge can check from outside: the terms never enter public
+  state, never appear in an event, never appear in an error message, and every action is checked
+  against them inside the proof.
 - **It does not give you** separation between the principal's knowledge and the agent's. An agent
   process that can read its own private state can read the terms.
 
-Closing that gap needs a delegated-prover flow, where the agent supplies the action and the
-principal's device, or a service holding the terms, produces the proof. That is real work and it
-is out of MVP scope. It is named here rather than left for a judge to discover.
+Closing that second gap needs a delegated-prover flow, where the agent supplies the action and the
+principal's device, or a service holding the terms, produces the proof. The `sealedAgentKey`
+witness is the seam it would use: the terms could stay with the principal while a separate key
+proves each action. That is real work and it is out of MVP scope. It is named here rather than left
+for a judge to discover.

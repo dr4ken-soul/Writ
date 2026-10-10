@@ -17,7 +17,12 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { WritRegistrySimulator, counterparty, testIdentity } from './writ-registry-simulator.js';
+import {
+  IntentClass,
+  WritRegistrySimulator,
+  counterparty,
+  testIdentity,
+} from './writ-registry-simulator.js';
 import { type WritTerms, setTestClock } from '../src/writ-registry-witnesses.js';
 
 const NOW = 1_800_000_000;
@@ -112,14 +117,17 @@ const walkLedger = (value: unknown, seen: WeakSet<object> = new WeakSet()): Walk
     }
     seen.add(asObject);
 
-    // The generated Map keeps its entries behind accessors rather than as plain
+    // The generated Map keeps its entries behind an iterator rather than as plain
     // properties, so it is expanded explicitly.
-    const maybeMap = node as { keys?: () => unknown; lookup?: (k: unknown) => unknown };
-    if (typeof maybeMap.keys === 'function' && typeof maybeMap.lookup === 'function') {
-      for (const key of maybeMap.keys()) {
-        visit(key);
-        visit(maybeMap.lookup(key));
+    const maybeMap = node as {
+      [Symbol.iterator]?: () => Iterator<[unknown, unknown]>;
+    };
+    if (typeof maybeMap[Symbol.iterator] === 'function') {
+      for (const entry of node as Iterable<[unknown, unknown]>) {
+        visit(entry[0]);
+        visit(entry[1]);
       }
+      return;
     }
 
     if (Array.isArray(node)) {
@@ -148,21 +156,21 @@ const walkLedger = (value: unknown, seen: WeakSet<object> = new WeakSet()): Walk
 describe('WritRegistry privacy', () => {
   let sim: WritRegistrySimulator;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     setTestClock(NOW);
-    sim = new WritRegistrySimulator(testIdentity('principal'), terms());
+    sim = await WritRegistrySimulator.create(testIdentity('principal'), terms);
   });
 
   afterEach(() => {
     setTestClock(null);
   });
 
-  it('never writes the sealed terms into public ledger state', () => {
-    const writ = sim.issueWrit(BigInt(WINDOW_END + 7200));
-    sim.checkAction(writ, SECRET_COUNTERPARTY, 123n, 1n);
+  it('never writes the sealed terms into public ledger state', async () => {
+    const writ = await sim.issueWrit(BigInt(WINDOW_END + 7200));
+    await sim.checkAction(writ, SECRET_COUNTERPARTY, 123n, IntentClass.TRANSFER);
     const action = sim.lastActionId();
     sim.switchIdentity(testIdentity('verifier'), terms);
-    sim.attest(action, 2n);
+    await sim.attest(action, 2n);
 
     const found = walkLedger(sim.getLedger());
     const hexBlob = found.hex.join(' ');
@@ -191,15 +199,15 @@ describe('WritRegistry privacy', () => {
     expect(found.numbers.has('2')).toBe(true);
   });
 
-  it('never puts the ceiling or the window into an error message', () => {
-    const writ = sim.issueWrit(BigInt(WINDOW_END + 7200));
+  it('never puts the ceiling or the window into an error message', async () => {
+    const writ = await sim.issueWrit(BigInt(WINDOW_END + 7200));
 
-    expect(() => sim.checkAction(writ, SECRET_COUNTERPARTY, CEILING, 1n)).not.toThrow();
+    await expect(sim.checkAction(writ, SECRET_COUNTERPARTY, CEILING, IntentClass.TRANSFER)).resolves.toBeDefined();
 
     // A rejected action must not leak its reason through a thrown error.
     let thrown = '';
     try {
-      sim.checkAction(writ, counterparty('not-allowed'), 500n, 1n);
+      await sim.checkAction(writ, counterparty('not-allowed'), 500n, IntentClass.TRANSFER);
     } catch (error) {
       thrown = String(error);
     }
@@ -207,16 +215,16 @@ describe('WritRegistry privacy', () => {
     expect(thrown).not.toContain('ceiling');
   });
 
-  it('produces a ledger that is not empty, so the checks above mean something', () => {
-    sim.issueWrit(BigInt(WINDOW_END + 7200));
+  it('produces a ledger that is not empty, so the checks above mean something', async () => {
+    await sim.issueWrit(BigInt(WINDOW_END + 7200));
     const found = walkLedger(sim.getLedger());
 
     expect(found.hex.length).toBeGreaterThan(0);
     expect(found.numbers.has('1')).toBe(true);
   });
 
-  it('keeps the commitment and the counter while hiding the terms', () => {
-    const writ = sim.issueWrit(BigInt(WINDOW_END + 7200));
+  it('keeps the commitment and the counter while hiding the terms', async () => {
+    const writ = await sim.issueWrit(BigInt(WINDOW_END + 7200));
     const ledger = sim.getLedger();
 
     expect(ledger.commitments.lookup(writ)).toHaveLength(32);

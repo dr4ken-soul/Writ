@@ -21,7 +21,7 @@
 // message or a return value. Every circuit below carries a comment stating what
 // it must never disclose.
 
-pragma language_version 0.23;
+pragma language_version 0.27.0;
 
 import CompactStandardLibrary;
 
@@ -38,6 +38,15 @@ export enum WritStatus {
   REJECTED,
   REVOKED,
   DISCLOSED
+}
+
+// The intent classes a mandate may permit. Compact has no bitwise operators, so
+// permissions are carried as one boolean per class rather than as a bitfield.
+export enum IntentClass {
+  TRANSFER,
+  SWAP,
+  CONTRACT_CALL,
+  DATA_ACCESS
 }
 
 // writ id -> commitment to the sealed terms.
@@ -62,6 +71,12 @@ export ledger expiries: Map<Bytes<32>, Uint<64>>;
 // asking the principal for anything. The level reveals how much may be
 // disclosed, never what the terms are.
 export ledger disclosureLevels: Map<Bytes<32>, Uint<8>>;
+
+// writ id -> the agent authorised to act under it. A hash of the agent's key,
+// bound to this contract address. Registering it stops any third party from
+// submitting actions against someone else's writ, which would otherwise flip the
+// writ's public status at will.
+export ledger agents: Map<Bytes<32>, Bytes<32>>;
 
 // action id -> writ id. Action ids are pseudonymous hashes handed to the
 // counterparty, so this map cannot be enumerated from the chain.
@@ -104,10 +119,14 @@ witness sealedCeiling(): Uint<64>;
 witness sealedWindowStart(): Uint<64>;
 witness sealedWindowEnd(): Uint<64>;
 witness sealedAllowlist(): Vector<8, Bytes<32>>;
-witness sealedActionMask(): Uint<8>;
+witness sealedPermits(): Vector<4, Boolean>;
 witness sealedDisclosureLevel(): Uint<8>;
 
 /// Agent private state.
+
+// The agent key registered for this writ. The principal names the agent at
+// issuance; only that agent's transactions are accepted afterwards.
+witness sealedAgentKey(): Bytes<32>;
 
 // The agent's secret key, used to derive a distinct action id per action.
 witness agentSecretKey(): Bytes<32>;
@@ -150,29 +169,31 @@ circuit derive(purpose: Bytes<32>, secret: Bytes<32>): Bytes<32> {
 // the proof. Nothing about the allowlist leaves this function, and the returned
 // boolean is never written to the ledger on its own.
 circuit allowlistContains(entry: Bytes<32>, list: Vector<8, Bytes<32>>): Boolean {
-  var index = 0;
-  var found = false;
-  while (index < 8) {
-    found = found || list[index] == entry;
-    index = index + 1;
-  }
-  return found;
+  return list[0] == entry ||
+    list[1] == entry ||
+    list[2] == entry ||
+    list[3] == entry ||
+    list[4] == entry ||
+    list[5] == entry ||
+    list[6] == entry ||
+    list[7] == entry;
 }
 
 // Maps an amount onto one of four spend bands using the private ceiling. The
 // ceiling is an input and never an output, so publishing the band does not
 // publish the ceiling. The band is coarse on purpose.
 circuit bandOf(amount: Uint<64>, ceiling: Uint<64>): Uint<8> {
-  const quarter = ceiling / 4;
-  const half = ceiling / 2;
-  const threeQuarters = (ceiling * 3) / 4;
-  if (amount <= quarter) {
+  const doubled = (amount * 2) as Uint<64>;
+  const quadrupled = (amount * 4) as Uint<64>;
+  const ceilingTripled = (ceiling * 3) as Uint<64>;
+
+  if (quadrupled <= ceiling) {
     return 0;
   }
-  if (amount <= half) {
+  if (doubled <= ceiling) {
     return 1;
   }
-  if (amount <= threeQuarters) {
+  if (quadrupled <= ceilingTripled) {
     return 2;
   }
   return 3;
@@ -216,30 +237,83 @@ circuit reasonCode(amountOk: Boolean, toOk: Boolean, timeOk: Boolean, intentOk: 
   return 0;
 }
 
+// Disclosure codes. The contract returns one of these and the SDK maps it to
+// the fact string, because Compact cannot build an Opaque in-circuit. The code
+// set is fixed and the circuit chooses which one, so the level gate and the one
+// fact per call property are unaffected.
+//
+// 0 within-writ
+// 1 rejected
+// 2 tier-0
+// 3 tier-1
+// 4 tier-2
+// 5 tier-3
+
 // The single fact disclosed at level 1: whether the action was within the writ.
-circuit booleanFact(verdict: Uint<8>): Opaque<"string"> {
+circuit booleanFact(verdict: Uint<8>): Uint<8> {
   if (verdict != 0) {
-    return Opaque<"string">("rejected");
+    return 1;
   }
-  return Opaque<"string">("within-writ");
+  return 0;
 }
 
 // The single fact disclosed at level 2: the coarse spend band. Not the amount
 // and not the ceiling.
-circuit bandFact(band: Uint<8>): Opaque<"string"> {
+circuit bandFact(band: Uint<8>): Uint<8> {
   if (band == 1) {
-    return Opaque<"string">("tier-1");
+    return 3;
   }
   if (band == 2) {
-    return Opaque<"string">("tier-2");
+    return 4;
   }
   if (band == 3) {
-    return Opaque<"string">("tier-3");
+    return 5;
   }
-  return Opaque<"string">("tier-0");
+  return 2;
 }
 
 // --- Public circuits --------------------------------------------------------
+
+// Runs every bound check and returns the reason code.
+//
+// The comparisons happen here and the disclose() sits on the return, which is
+// the declaration the compiler asks for: the bounds are permitted to reach the
+// value that leaves the circuit. Nothing else in the circuit publishes them.
+circuit scopeCheck(
+  amount: Uint<64>,
+  to: Bytes<32>,
+  intent: IntentClass,
+  ceiling: Uint<64>,
+  windowStart: Uint<64>,
+  windowEnd: Uint<64>,
+  allowlist: Vector<8, Bytes<32>>,
+  permits: Vector<4, Boolean>,
+  now: Uint<64>,
+  expiry: Uint<64>,
+  writActive: Boolean
+): Uint<8> {
+  const amountOk = amount <= ceiling;
+  const toOk = allowlistContains(to, allowlist);
+  const timeOk = (now >= windowStart) && (now <= windowEnd) && (now <= expiry);
+  const intentOk =
+    (intent == IntentClass.TRANSFER && permits[0]) ||
+    (intent == IntentClass.SWAP && permits[1]) ||
+    (intent == IntentClass.CONTRACT_CALL && permits[2]) ||
+    (intent == IntentClass.DATA_ACCESS && permits[3]);
+
+  return disclose(reasonCode(amountOk, toOk, timeOk, intentOk, writActive));
+}
+
+// The status a writ takes after an action, derived only from the already
+// disclosed verdict. Keeping this downstream of the disclosed boolean is what
+// stops the compiler treating the status write as a leak of the sealed terms:
+// the status depends on one public bit, not on the bounds themselves.
+circuit statusFor(verdict: Uint<8>): WritStatus {
+  if (verdict == 0) {
+    return WritStatus.ACTIVE;
+  }
+  return WritStatus.REJECTED;
+}
 
 /// ISSUE
 /// Records the commitment to a sealed mandate and opens the writ.
@@ -272,13 +346,16 @@ export circuit issueWrit(expiry: Uint<64>): Bytes<32> {
   const allowlistHash = persistentHash<Vector<8, Bytes<32>>>(
     [list[0], list[1], list[2], list[3], list[4], list[5], list[6], list[7]]
   );
+  const permits = sealedPermits();
 
   const terms = persistentHash<Vector<5, Bytes<32>>>([
     (sealedCeiling() as Field as Bytes<32>),
     (sealedWindowStart() as Field as Bytes<32>),
     (sealedWindowEnd() as Field as Bytes<32>),
     allowlistHash,
-    (sealedActionMask() as Field as Bytes<32>)
+    // The mask is committed through a hash of its four permissions, so the
+    // commitment covers what is permitted without carrying the vector itself.
+    persistentHash<Vector<4, Boolean>>([permits[0], permits[1], permits[2], permits[3]])
   ]);
 
   commitments.insert(writId, persistentCommit<Bytes<32>>(terms, salt));
@@ -293,7 +370,11 @@ export circuit issueWrit(expiry: Uint<64>): Bytes<32> {
   // afterwards: no other circuit writes disclosureLevels.
   disclosureLevels.insert(writId, disclose(sealedDisclosureLevel()));
 
-  writCount = disclose(writCount + 1);
+  // The agent authorised to act. Fixed here, at issuance, and never changed:
+  // no other circuit writes agents.
+  agents.insert(writId, disclose(derive(pad(32, "writ:agent:"), sealedAgentKey())));
+
+  writCount = disclose((writCount + 1) as Uint<64>);
 
   return writId;
 }
@@ -311,30 +392,47 @@ export circuit checkAction(
   writ: Bytes<32>,
   to: Bytes<32>,
   amount: Uint<64>,
-  intent: Uint<8>
+  intent: IntentClass
 ): Uint<8> {
-  assert(commitments.member(writ), "Unknown writ");
+  // The writ id is public by design: it is the handle the counterparty is
+  // given. Disclosing it once here keeps every later ledger operation downstream
+  // of a declared public value.
+  const writPublic = disclose(writ);
+  assert(commitments.member(writPublic), "Unknown writ");
+
+  // Only the agent the principal registered at issuance may act. Without this,
+  // anyone holding the writ id could submit an action and change its status.
+  assert(
+    agents.lookup(writPublic) == derive(pad(32, "writ:agent:"), agentSecretKey()),
+    "This agent is not authorised for this writ"
+  );
 
   const ceiling = sealedCeiling();
   const windowStart = sealedWindowStart();
   const windowEnd = sealedWindowEnd();
   const allowlist = sealedAllowlist();
-  const actionMask = sealedActionMask();
+  const permits = sealedPermits();
 
   const now = currentTimestamp();
 
-  // Every comparison below runs inside the proof. Only the resulting verdict
-  // is ever published.
-  const amountOk = amount <= ceiling;
-  const toOk = allowlistContains(to, allowlist);
-  const timeOk = now >= windowStart && now <= windowEnd && now <= expiries.lookup(writ);
-  const intentOk = (actionMask & intent) == intent;
-
-  const status = statuses.lookup(writ);
+  const status = statuses.lookup(writPublic);
   const writActive = status == WritStatus.SEALED || status == WritStatus.ACTIVE;
 
-  const code = reasonCode(amountOk, toOk, timeOk, intentOk, writActive);
-  const inScope = code == 0;
+  // Every bound is checked inside the proof. Only the reason code and the
+  // one-bit verdict leave this function.
+  const code = scopeCheck(
+    amount,
+    to,
+    intent,
+    ceiling,
+    windowStart,
+    windowEnd,
+    allowlist,
+    permits,
+    now,
+    expiries.lookup(writPublic),
+    writActive
+  );
 
   // A distinct action id per action, derived from the agent key so two agents
   // cannot collide and so an agent cannot forge another agent's action.
@@ -343,24 +441,32 @@ export circuit checkAction(
     (actionCount as Field as Bytes<32>)
   ]);
   const actionId = disclose(derive(pad(32, "writ:action:"), serial));
-  actionCount = disclose(actionCount + 1);
+  actionCount = disclose((actionCount + 1) as Uint<64>);
 
-  actionWrits.insert(actionId, writ);
-  actionVerdicts.insert(actionId, disclose(boolToUint(inScope)));
+  // The verdict is deliberately public. It is the one bit a counterparty is
+  // entitled to, and it is the only output of the check that leaves the circuit.
+  // The verdict is disclosed before it is used, so the status write below is a
+  // function of a public value and not of the sealed terms.
+  //
+  // Encoding: 0 in scope, 1 rejected. Everything downstream reads it that way.
+  const verdict = disclose(boolToUint(code != 0));
+
+  actionWrits.insert(actionId, writPublic);
+  actionVerdicts.insert(actionId, verdict);
   actionBands.insert(actionId, disclose(bandOf(amount, ceiling)));
 
-  if (inScope) {
-    statuses.insert(writ, disclose(WritStatus.ACTIVE));
-    inScopeCount = disclose(inScopeCount + 1);
-  } else {
-    statuses.insert(writ, disclose(WritStatus.REJECTED));
+  statuses.insert(writPublic, statusFor(verdict));
+
+  if (verdict == 0) {
+    inScopeCount = disclose((inScopeCount + 1) as Uint<64>);
   }
 
   // The reason code is this circuit's return value. In Compact a return value
   // goes to the calling wallet and is not part of the public transaction, so
   // this is the only path by which a reason code travels and it terminates at
-  // the agent.
-  return code;
+  // the agent. The disclose() declares, to the compiler, that the bounds are
+  // permitted to reach the return value. It does not publish them.
+  return disclose(code);
 }
 
 /// DISCLOSE
@@ -371,10 +477,11 @@ export circuit checkAction(
 /// Must never disclose: the ceiling, the window, the allowlist, the action
 /// mask, or any second fact in the same call.
 
-export circuit attest(action: Bytes<32>, level: Uint<8>): Opaque<"string"> {
-  assert(actionWrits.member(action), "Unknown action");
+export circuit attest(action: Bytes<32>, level: Uint<8>): Uint<8> {
+  const actionPublic = disclose(action);
+  assert(actionWrits.member(actionPublic), "Unknown action");
 
-  const writ = actionWrits.lookup(action);
+  const writ = actionWrits.lookup(actionPublic);
   const ceilingLevel = disclosureLevels.lookup(writ);
 
   // Reverted rather than silently downgraded, and the error names no value, so
@@ -383,7 +490,11 @@ export circuit attest(action: Bytes<32>, level: Uint<8>): Opaque<"string"> {
   assert(level > 0, "This writ carries no disclosure policy");
   assert(level <= ceilingLevel, "Disclosure level exceeds the level fixed at issuance");
 
-  const fact = selectFact(actionVerdicts.lookup(action), actionBands.lookup(action), level);
+  const fact = selectFact(
+    actionVerdicts.lookup(actionPublic),
+    actionBands.lookup(actionPublic),
+    level
+  );
 
   // Append to the disclosure log. The entry binds the previous root, the
   // verifier's pseudonymous reference and the action, so the log proves that a
@@ -391,9 +502,9 @@ export circuit attest(action: Bytes<32>, level: Uint<8>): Opaque<"string"> {
   // disclosed.
   const verifier = disclose(derive(pad(32, "writ:verifier:"), verifierSecretKey()));
   auditRoot = disclose(persistentHash<Vector<4, Bytes<32>>>(
-    [pad(32, "writ:audit:entry:"), auditRoot, verifier, action]
+    [pad(32, "writ:audit:entry:"), auditRoot, verifier, actionPublic]
   ));
-  auditCount = disclose(auditCount + 1);
+  auditCount = disclose((auditCount + 1) as Uint<64>);
   statuses.insert(writ, disclose(WritStatus.DISCLOSED));
 
   // Exactly one fact, returned only to this caller.
@@ -402,7 +513,7 @@ export circuit attest(action: Bytes<32>, level: Uint<8>): Opaque<"string"> {
 
 // Chooses which single fact to disclose. Exactly one branch runs and exactly one
 // value is produced.
-circuit selectFact(verdict: Uint<8>, band: Uint<8>, level: Uint<8>): Opaque<"string"> {
+circuit selectFact(verdict: Uint<8>, band: Uint<8>, level: Uint<8>): Uint<8> {
   if (level == 1) {
     return booleanFact(verdict);
   }
@@ -415,11 +526,12 @@ circuit selectFact(verdict: Uint<8>, band: Uint<8>, level: Uint<8>): Opaque<"str
 /// Must never disclose: the terms, and no fact about why the writ is revoked.
 
 export circuit revoke(writ: Bytes<32>): [] {
+  const writPublic = disclose(writ);
   const secret = principalSecretKey();
-  assert(commitments.member(writ), "Unknown writ");
-  assert(principals.lookup(writ) == derive(pad(32, "writ:principal:"), secret),
+  assert(commitments.member(writPublic), "Unknown writ");
+  assert(principals.lookup(writPublic) == derive(pad(32, "writ:principal:"), secret),
     "Only the issuing principal may revoke this writ");
-  statuses.insert(writ, disclose(WritStatus.REVOKED));
+  statuses.insert(writPublic, disclose(WritStatus.REVOKED));
 }
 
 /// READ
@@ -427,8 +539,9 @@ export circuit revoke(writ: Bytes<32>): [] {
 /// hold the writ compare it against their own sealed copy to confirm identity.
 
 export circuit statusOf(writ: Bytes<32>): Bytes<32> {
-  assert(commitments.member(writ), "Unknown writ");
-  return commitments.lookup(writ);
+  const writPublic = disclose(writ);
+  assert(commitments.member(writPublic), "Unknown writ");
+  return commitments.lookup(writPublic);
 }
 
 /// READ

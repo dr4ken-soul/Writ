@@ -168,25 +168,27 @@ That test is the submission.
 
 ## 13. What we built
 
-- Two Compact contracts on Midnight, language version 0.23
+- Two Compact contracts on Midnight, **compiled with `compact 0.5.3`**, 12 circuits with provers and
+  verifiers generated
 - Real witness-held private state and a real dual-ledger split
 - Contract-controlled disclosure with a fixed issuance-time ceiling
+- An agent bound at issuance, so only the registered agent can act on a writ
 - `@writ/sdk`: five typed calls, transport-agnostic, 26 passing tests
+- 23 contract tests, including the byte-level privacy assertion, all green
 - A Next.js console covering principal, agent and verifier, with no off-chain database
 
 ---
 
 ## 14. Honest status
 
-Built and verified: the SDK and the frontend. They typecheck, build and pass their tests, and the
-site renders end to end.
+Verified and green: both contracts compile, 23 contract tests pass, the SDK passes 26 tests and
+typechecks, and the frontend builds and renders across all six routes.
 
-Not yet verified: the contracts have not been compiled, because the Compact compiler publishes no
-Windows binary and no container runtime was available on the build machine. They are written
-against the current reference and every circuit documents what it must never disclose, but
-compiling them is the next step and it is the buildathon's technical gate.
+Not done: deployment. Everything above ran against the compiled circuit in process, which is why
+the suites need no node, but an end-to-end run against a live network still needs a funded wallet.
+Where the app needs a contract that is not deployed, it says so rather than showing a number.
 
-No placeholder data anywhere. Where the app needs a deployment it does not have, it says so.
+No placeholder data anywhere in the repository.
 
 ---
 

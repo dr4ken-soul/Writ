@@ -31,7 +31,12 @@ export {
 
 export { issueWrit, sealWritTerms, type IssueInput, type IssueResult } from './issue.js';
 export { checkAction, type ActInput } from './act.js';
-export { attest, DISCLOSED_FACTS, type AttestInput } from './attest.js';
+export {
+  attest,
+  DISCLOSED_FACTS,
+  toDisclosedFact,
+  type AttestInput,
+} from './attest.js';
 export { metrics, revoke, status, type LedgerMetrics } from './lifecycle.js';
 export {
   ALLOWLIST_CAPACITY,

@@ -9,16 +9,27 @@
  * scope, disclosure and privacy tests need no devnet and no wallet. What it
  * proves is the circuit's behaviour and, for the privacy suite, what the public
  * ledger state actually contains after a writ has been issued.
+ *
+ * The compact runtime is asynchronous: every circuit call returns a promise and
+ * a fresh context, so this class threads the contract state and the private
+ * state through each call.
  */
 
 import {
   type CircuitContext,
-  QueryContext,
-  sampleContractAddress,
-  createConstructorContext,
   CostModel,
+  createCircuitContext,
+  createConstructorContext,
+  emptyZswapLocalState,
+  sampleContractAddress,
 } from '@midnight-ntwrk/compact-runtime';
-import { Contract, type Ledger, ledger } from '../src/managed/writ-registry/contract/index.js';
+import {
+  Contract,
+  IntentClass,
+  WritStatus,
+  type Ledger,
+  ledger,
+} from '../src/managed/writ-registry/contract/index.js';
 import {
   type WritRegistryPrivateState,
   type WritTerms,
@@ -26,6 +37,8 @@ import {
   withTerms,
   writRegistryWitnesses,
 } from '../src/writ-registry-witnesses.js';
+
+export { IntentClass, WritStatus };
 
 /** The three keys the contract witnesses read. */
 export type Identity = {
@@ -54,14 +67,63 @@ export const testIdentity = (label: string): Identity => ({
 export const counterparty = (label: string): Uint8Array => key(`counterparty:${label}`);
 
 /**
+ * Maps a disclosure code to the single fact it stands for.
+ *
+ * Compact cannot build an Opaque in-circuit, so the contract returns a code from
+ * a fixed set and the client renders the fact. The mapping is total and the code
+ * is chosen by the circuit, so the level gate and the one fact per call property
+ * are unaffected.
+ * @param code - the value returned by attest
+ * @returns the disclosed fact
+ */
+export const disclosureFact = (code: bigint | number): string => {
+  const facts = ['within-writ', 'rejected', 'tier-0', 'tier-1', 'tier-2', 'tier-3'];
+  return facts[Number(code)] ?? 'rejected';
+};
+
+/**
  * Serves as a testbed to exercise WritRegistry in tests.
+ *
+ * Built with `WritRegistrySimulator.create` because the runtime's constructor
+ * path is asynchronous.
  */
 export class WritRegistrySimulator {
   readonly contract: Contract<WritRegistryPrivateState>;
-  circuitContext: CircuitContext<WritRegistryPrivateState>;
+  /** This simulator's own contract address. Bound once, so ids derive stably. */
+  private readonly address: ReturnType<typeof sampleContractAddress>;
+  private context: CircuitContext<WritRegistryPrivateState>;
+  /**
+   * The ledger state the next call executes against.
+   *
+   * Tracked here rather than read back out of `queryContexts`, because that map
+   * is keyed by contract address and only holds entries for contracts that have
+   * actually been called in this context.
+   */
+  private contractState: unknown;
 
-  constructor(identity: Identity = testIdentity('default'), terms: WritTerms | null = null) {
-    this.contract = new Contract<WritRegistryPrivateState>(writRegistryWitnesses);
+  private constructor(
+    contract: Contract<WritRegistryPrivateState>,
+    context: CircuitContext<WritRegistryPrivateState>,
+    contractState: unknown,
+    address: ReturnType<typeof sampleContractAddress>,
+  ) {
+    this.contract = contract;
+    this.context = context;
+    this.contractState = contractState;
+    this.address = address;
+  }
+
+  /**
+   * Builds a simulator with a fresh contract and its initial ledger state.
+   * @param identity - the keys to act with
+   * @param terms - the mandate to seal, or null to act without one
+   * @returns a ready simulator
+   */
+  public static async create(
+    identity: Identity = testIdentity('default'),
+    terms: WritTerms | null = null,
+  ): Promise<WritRegistrySimulator> {
+    const contract = new Contract<WritRegistryPrivateState>(writRegistryWitnesses);
 
     const base: WritRegistryPrivateState = {
       ...createWritRegistryPrivateState(),
@@ -70,15 +132,63 @@ export class WritRegistrySimulator {
     };
     const privateState = terms === null ? base : withTerms(base, terms);
 
-    const { currentPrivateState, currentContractState, currentZswapLocalState } =
-      this.contract.initialState(createConstructorContext(privateState, '0'.repeat(64)));
+    const coinPublicKey = '0'.repeat(64);
+    const { currentPrivateState, currentContractState } = await contract.initialState(
+      createConstructorContext(privateState, coinPublicKey),
+    );
 
-    this.circuitContext = {
-      currentPrivateState,
-      currentZswapLocalState,
+    const address = sampleContractAddress();
+
+    const context = createCircuitContext<WritRegistryPrivateState>({
+      circuitId: 'issueWrit',
+      contractAddress: address,
+      coinPublicKeyOrZswapState: emptyZswapLocalState(coinPublicKey),
+      contractState: currentContractState,
+      privateState: currentPrivateState,
       costModel: CostModel.initialCostModel(),
-      currentQueryContext: new QueryContext(currentContractState.data, sampleContractAddress()),
-    };
+    });
+
+    return new WritRegistrySimulator(contract, context, currentContractState, address);
+  }
+
+  /**
+   * Runs one circuit and keeps the resulting context for the next call.
+   * @param circuitId - the circuit to run
+   * @param invoke - the circuit function to call
+   * @param args - the circuit arguments
+   * @returns the circuit result
+   */
+  private async run<R>(
+    circuitId: string,
+    invoke: (context: CircuitContext<WritRegistryPrivateState>, ...args: never[]) => Promise<{
+      result: R;
+      context: CircuitContext<WritRegistryPrivateState>;
+    }>,
+    ...args: unknown[]
+  ): Promise<R> {
+    const next = createCircuitContext<WritRegistryPrivateState>({
+      circuitId,
+      contractAddress: this.address,
+      coinPublicKeyOrZswapState: emptyZswapLocalState('0'.repeat(64)),
+      contractState: this.contractState,
+      privateState: this.privateState,
+      costModel: CostModel.initialCostModel(),
+    });
+
+    const { result, context } = await invoke(next, ...(args as never[]));
+    this.context = context;
+
+    const nextState = Object.values(context.queryContexts)[0];
+    if (nextState !== undefined) {
+      this.contractState = nextState.state;
+    }
+
+    return result;
+  }
+
+  /** The private state the next call executes against. */
+  private get privateState(): WritRegistryPrivateState {
+    return this.context.callContext.currentPrivateState as WritRegistryPrivateState;
   }
 
   /**
@@ -92,11 +202,7 @@ export class WritRegistrySimulator {
    * @param terms - terms to carry across, or null to act without a mandate
    */
   public switchIdentity(identity: Identity, terms: WritTerms | null = null): void {
-    this.circuitContext.currentPrivateState = {
-      ...this.circuitContext.currentPrivateState,
-      ...identity,
-      terms,
-    };
+    this.context.callContext.currentPrivateState = { ...this.privateState, ...identity, terms };
   }
 
   /**
@@ -105,84 +211,66 @@ export class WritRegistrySimulator {
    * @param terms - the mandate terms
    */
   public sealTerms(terms: WritTerms): void {
-    this.circuitContext.currentPrivateState = withTerms(
-      this.circuitContext.currentPrivateState,
-      terms,
-    );
+    this.context.callContext.currentPrivateState = withTerms(this.privateState, terms);
   }
 
   /** Reads the public ledger state. */
   public getLedger(): Ledger {
-    return ledger(this.circuitContext.currentQueryContext.state);
+    return ledger(this.contractState as never);
   }
 
   /** Issues a writ and returns the new writ id. */
-  public issueWrit(expiry: bigint): Uint8Array {
-    const { context, result } = this.contract.impureCircuits.issueWrit(this.circuitContext, expiry);
-    this.circuitContext = context;
-    return result;
+  public issueWrit(expiry: bigint): Promise<Uint8Array> {
+    return this.run('issueWrit', this.contract.impureCircuits.issueWrit, expiry);
   }
 
   /**
-   * Checks one action and returns the reason code, the private value that only
-   * the agent wallet receives.
-   * @returns the reason code as written by the contract
+   * Checks one action and returns the reason code, the private value only the
+   * agent wallet receives.
+   * @returns the reason code
    */
   public checkAction(
     writ: Uint8Array,
     to: Uint8Array,
     amount: bigint,
-    intent: bigint,
-  ): bigint {
-    const { context, result } = this.contract.impureCircuits.checkAction(
-      this.circuitContext,
-      writ,
-      to,
-      amount,
-      intent,
-    );
-    this.circuitContext = context;
-    return result;
+    intent: IntentClass,
+  ): Promise<bigint> {
+    return this.run('checkAction', this.contract.impureCircuits.checkAction, writ, to, amount, intent);
   }
 
   /**
    * Requests one scoped disclosure and returns the single disclosed fact.
-   * @returns the disclosed fact string
+   * @returns the disclosed fact
    */
-  public attest(action: Uint8Array, level: bigint): string {
-    const { context, result } = this.contract.impureCircuits.attest(
-      this.circuitContext,
-      action,
-      level,
+  public attest(action: Uint8Array, level: bigint): Promise<string> {
+    return this.run('attest', this.contract.impureCircuits.attest, action, level).then(
+      disclosureFact,
     );
-    this.circuitContext = context;
-    return result;
   }
 
   /** Revokes a writ. */
-  public revoke(writ: Uint8Array): void {
-    const { context } = this.contract.impureCircuits.revoke(this.circuitContext, writ);
-    this.circuitContext = context;
+  public revoke(writ: Uint8Array): Promise<void> {
+    return this.run('revoke', this.contract.impureCircuits.revoke, writ).then(() => undefined);
   }
 
   /** Public read of a writ's commitment. */
-  public statusOf(writ: Uint8Array): Uint8Array {
-    return this.contract.circuits.statusOf(this.circuitContext, writ).result;
+  public statusOf(writ: Uint8Array): Promise<Uint8Array> {
+    return this.run('statusOf', this.contract.circuits.statusOf, writ);
   }
 
   /** Public read of the disclosure log root. */
-  public auditRootOf(): Uint8Array {
-    return this.contract.circuits.auditRootOf(this.circuitContext).result;
+  public auditRootOf(): Promise<Uint8Array> {
+    return this.run('auditRootOf', this.contract.circuits.auditRootOf);
   }
 
   /** Public read of the writ counter. */
-  public writCountOf(): bigint {
-    return this.contract.circuits.writCountOf(this.circuitContext).result;
+  public writCountOf(): Promise<bigint> {
+    return this.run('writCountOf', this.contract.circuits.writCountOf);
   }
 
   /** Public read of the in scope action counter. */
-  public inScopeCountOf(): bigint {
-    return this.contract.circuits.inScopeCountOf(this.circuitContext).result;
+  public inScopeCountOf(): Promise<bigint> {
+    return this.run('inScopeCountOf', this.contract.circuits.inScopeCountOf);
   }
 
   /**
@@ -195,9 +283,8 @@ export class WritRegistrySimulator {
    * @returns the most recent action id
    */
   public lastActionId(): Uint8Array {
-    const state = this.getLedger();
-    const index = Number(state.actionCount) - 1;
-    const keys = state.actionWrits.keys();
-    return keys[index] as Uint8Array;
+    const entries = [...this.getLedger().actionWrits];
+    const last = entries[entries.length - 1];
+    return last![0];
   }
 }

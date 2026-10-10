@@ -19,32 +19,45 @@ Read this before judging the code. It is the most important section in the file.
 
 | Area | State | Evidence |
 |---|---|---|
+| `contracts/src/*.compact` | **Compiles** | `compact 0.5.3`, 8 circuits in WritRegistry and 4 in AuditLog, provers and verifiers generated |
+| `contracts/test/*.test.ts` | **23 of 23 pass** | run against the compiled circuit in memory, no devnet needed |
 | `@writ/sdk` | **Built and tested** | 26 of 26 tests pass, `tsc` clean, package builds |
 | `web` (landing + console) | **Built and tested** | `next build` clean across all 6 routes, verified in a browser |
-| `contracts/src/*.compact` | **Written, not compiled** | see below |
-| `contracts/test/*.test.ts` | **Written, not run** | see below |
-| Deployment to a Midnight network | **Not done** | see below |
+| Deployment to a Midnight network | **Not done** | needs a node and a funded wallet |
 
-### What has not been verified, and why
+### How the contracts are compiled
 
-Three things prevented the contracts from being compiled and run in the machine this was built
-on, and they are worth stating plainly rather than burying:
+The Compact compiler publishes no Windows binary. The release artefacts are
+`apple-darwin` and `x86_64-unknown-linux-musl`, so on Windows the build runs inside WSL:
 
-1. **No Windows binary exists for the Compact compiler.** The `compact-v0.5.3` release publishes
-   `apple-darwin` and `aarch64-linux-musl` artefacts only. There is no Windows target.
-2. **No container runtime was available**, so `midnightntwrk/midnight-local-dev` could not be
-   started and the contract test suites could not be executed.
-3. **No Midnight wallet was available**, so no deployment or end-to-end wallet run was possible.
+```bash
+# once
+curl -sL https://github.com/midnightntwrk/compact/releases/download/compact-v0.5.3/compact-x86_64-unknown-linux-musl.tar.xz | tar -xJ
 
-The Compact sources are written against the current reference (`pragma language_version 0.23`,
-matching the official `midnightntwrk/example-bboard` and `midnight-examples/private-bid` examples)
-and every circuit carries a comment on what it must never disclose. But they have **not been
-compiled**, and this README does not claim otherwise. Running `npm run compact` on Linux or macOS
-is the first thing to do, and it is the buildathon's technical gate.
+# every build
+cd contracts/scripts && bash compact-build.sh
+```
 
-The frontend and SDK are genuinely verified: they build, typecheck, pass their tests and render.
-Where the app needs a contract that is not deployed, it says so in the interface rather than
-inventing a number.
+`contracts/scripts/compact-build.sh` compiles both contracts into
+`contracts/src/managed/`. The script is also the single entry point on Linux and
+macOS, where you can point `COMPACT_BIN` at your install instead.
+
+### What is still not verified
+
+Two things, and neither is a claim in disguise:
+
+1. **No deployment.** There are no contract addresses, so
+   `NEXT_PUBLIC_WRIT_REGISTRY_ADDRESS` is unset and the frontend renders its
+   explicit "no deployment configured" state rather than a plausible number.
+   Deploying needs a running node and a funded Midnight wallet, neither of which
+   existed on the build machine.
+2. **No funded wallet.** Everything above was exercised against the compiled
+   circuit in process, which is why the test suites can run without a node, but
+   an end-to-end run against a live network is still outstanding.
+
+The contracts themselves are compiled, the full private-state flow is proven by a
+byte-level assertion over the real ledger, and the frontend is verified in a
+browser. That is the honest boundary.
 
 ---
 
@@ -125,18 +138,18 @@ contracts are deployed. Without it the landing page and console render an explic
 
 ### The contracts
 
-Requires the Compact compiler and a local node. The test suites run against the compiled circuit
-in memory, so they need no devnet, but they do need the compiler.
+Needs the Compact compiler. `contracts/scripts/compact-build.sh` is the entry point, and the test
+suites run against the compiled circuit in memory, so they need no devnet.
 
 ```bash
 cd contracts
 npm install
 npm run compact    # writes src/managed/*
-npm test
+npm test           # 23 tests
 ```
 
-For a local node, follow the `midnightntwrk/midnight-local-dev` guide, then record the deployed
-addresses in the root `.env`.
+On Windows, run the compile through WSL as shown above. For a local node, follow the
+`midnightntwrk/midnight-local-dev` guide, then record the deployed addresses in the root `.env`.
 
 ---
 
@@ -145,11 +158,13 @@ addresses in the root `.env`.
 1. **Read the contract.** `contracts/src/WritRegistry.compact` opens with a comment stating, for
    each circuit, exactly what it must never disclose. Confirm the terms never reach a ledger
    write.
-2. **Compile it.** `cd contracts && npm run compact`. The ledger declarations at the top of the
-   file are the entire public surface: commitments, statuses, principals, expiries, disclosure
-   levels, action records, three counters and the audit root.
-3. **Run the scope suite.** `npm test`. An in-scope action returns 0; amount, recipient, window and
-   intent each return their own reason code.
+2. **Compile it.** `cd contracts/scripts && bash compact-build.sh` on Linux or macOS, or through
+   WSL on Windows. The ledger declarations at the top of the file are the entire public surface:
+   commitments, statuses, principals, expiries, disclosure levels, the authorised agent, action
+   records, four counters and the audit root.
+3. **Run the scope suite.** `cd contracts && npm test`. An in-scope action returns 0; amount,
+   recipient, window and intent each return their own reason code, and an agent that was not
+   registered at issuance is refused.
 4. **Run the privacy suite.** `contracts/test/privacy.test.ts` issues a writ with a ceiling of
    `987654321`, acts on it, attests, then walks the entire public ledger and fails if the ceiling,
    the window or the allowlist entry appears in any encoding. It also fails if the ledger is empty,

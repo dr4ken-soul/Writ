@@ -82,7 +82,7 @@ export const browserTransport: WritTransport = {
     return resolveClient();
   },
 
-  async submitAttest(input: { actionId: Uint8Array; level: DisclosureLevel }) {
+  async submitAttest(input: { actionId: Uint8Array; level: DisclosureLevel }): Promise<bigint> {
     void input;
     return resolveClient();
   },

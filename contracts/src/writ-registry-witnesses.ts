@@ -160,15 +160,31 @@ export const writRegistryWitnesses: Witnesses<WritRegistryPrivateState> = {
     padAllowlist(requireTerms(privateState, 'allowlist')),
   ],
 
-  sealedActionMask: ({ privateState }) => [
-    privateState,
-    BigInt(requireTerms(privateState, 'actionMask')),
-  ],
+  // Compact has no bitwise operators, so the action mask is carried across as
+  // one boolean per intent class, in IntentClass order: transfer, swap,
+  // contract call, data access.
+  sealedPermits: ({ privateState }) => {
+    const mask = requireTerms(privateState, 'actionMask');
+    return [
+      privateState,
+      [
+        (mask & 0b0001) !== 0,
+        (mask & 0b0010) !== 0,
+        (mask & 0b0100) !== 0,
+        (mask & 0b1000) !== 0,
+      ],
+    ];
+  },
 
   sealedDisclosureLevel: ({ privateState }) => [
     privateState,
     BigInt(requireTerms(privateState, 'disclosureLevel')),
   ],
+
+  // The agent key the principal registered at issuance. In the single-device
+  // MVP this is the same key the agent acts with; a delegated-prover build would
+  // supply the agent's key here while the terms stayed with the principal.
+  sealedAgentKey: ({ privateState }) => [privateState, privateState.agentSecretKey],
 
   /**
    * Reads the current unix time in seconds.

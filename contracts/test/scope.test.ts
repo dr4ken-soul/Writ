@@ -5,13 +5,14 @@
 /*
  * Scope behaviour.
  *
- * An in scope action returns reason code 0. Each out of scope dimension rejects
- * with its own reason code, so the agent can be told what went wrong without
- * the public ledger learning which bound stopped it.
+ * An in-scope action returns reason code 0. Each out-of-scope dimension rejects
+ * with its own reason code, so the agent can be told what went wrong without the
+ * public ledger learning which bound stopped it.
  */
 
-import { beforeEach, afterEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
+  IntentClass,
   WritRegistrySimulator,
   counterparty,
   testIdentity,
@@ -50,99 +51,126 @@ describe('WritRegistry scope circuit', () => {
 
   beforeEach(() => {
     setTestClock(NOW);
-    sim = new WritRegistrySimulator(testIdentity('principal'), terms());
   });
 
   afterEach(() => {
     setTestClock(null);
   });
 
-  it('issues a writ and returns a writ id', () => {
-    const writ = sim.issueWrit(BigInt(NOW + 7200));
+  /** Builds a simulator carrying the supplied terms. */
+  const withTerms = async (overrides: Partial<WritTerms> = {}): Promise<WritRegistrySimulator> =>
+    WritRegistrySimulator.create(testIdentity('principal'), terms(overrides));
+
+  it('issues a writ and returns a writ id', async () => {
+    sim = await withTerms();
+
+    const writ = await sim.issueWrit(BigInt(NOW + 7200));
 
     expect(writ).toHaveLength(32);
-    expect(sim.getLedger().commitments.size()).toBe(1);
+    expect(sim.getLedger().commitments.size()).toBe(1n);
   });
 
-  it('accepts an action inside every bound', () => {
-    const writ = sim.issueWrit(BigInt(NOW + 7200));
+  it('accepts an action inside every bound', async () => {
+    sim = await withTerms();
+    const writ = await sim.issueWrit(BigInt(NOW + 7200));
 
-    const reason = sim.checkAction(writ, COUNTERPARTY_A, 500n, 1n);
+    const reason = await sim.checkAction(writ, COUNTERPARTY_A, 500n, IntentClass.TRANSFER);
 
     expect(reason).toBe(REASON.IN_SCOPE);
-    expect(sim.inScopeCountOf()).toBe(1n);
+    expect(await sim.inScopeCountOf()).toBe(1n);
   });
 
-  it('rejects an amount above the sealed ceiling', () => {
-    const writ = sim.issueWrit(BigInt(NOW + 7200));
+  it('rejects an amount above the sealed ceiling', async () => {
+    sim = await withTerms();
+    const writ = await sim.issueWrit(BigInt(NOW + 7200));
 
-    const reason = sim.checkAction(writ, COUNTERPARTY_A, 1001n, 1n);
+    const reason = await sim.checkAction(writ, COUNTERPARTY_A, 1001n, IntentClass.TRANSFER);
 
     expect(reason).toBe(REASON.AMOUNT);
-    expect(sim.inScopeCountOf()).toBe(0n);
+    expect(await sim.inScopeCountOf()).toBe(0n);
   });
 
-  it('rejects a recipient outside the sealed allowlist', () => {
-    const writ = sim.issueWrit(BigInt(NOW + 7200));
+  it('rejects a recipient outside the sealed allowlist', async () => {
+    sim = await withTerms();
+    const writ = await sim.issueWrit(BigInt(NOW + 7200));
 
-    const reason = sim.checkAction(writ, COUNTERPARTY_C, 500n, 1n);
+    const reason = await sim.checkAction(writ, COUNTERPARTY_C, 500n, IntentClass.TRANSFER);
 
     expect(reason).toBe(REASON.RECIPIENT);
   });
 
-  it('rejects an action before the window opens', () => {
-    const writ = sim.issueWrit(BigInt(NOW + 7200));
+  it('rejects an action before the window opens', async () => {
+    sim = await withTerms();
+    const writ = await sim.issueWrit(BigInt(NOW + 7200));
 
     setTestClock(NOW - 7200);
-    const reason = sim.checkAction(writ, COUNTERPARTY_A, 500n, 1n);
+    const reason = await sim.checkAction(writ, COUNTERPARTY_A, 500n, IntentClass.TRANSFER);
 
     expect(reason).toBe(REASON.WINDOW);
   });
 
-  it('rejects an action after the window closes', () => {
-    const writ = sim.issueWrit(BigInt(NOW + 7200));
+  it('rejects an action after the window closes', async () => {
+    sim = await withTerms();
+    const writ = await sim.issueWrit(BigInt(NOW + 7200));
 
     setTestClock(NOW + 7200);
-    const reason = sim.checkAction(writ, COUNTERPARTY_A, 500n, 1n);
+    const reason = await sim.checkAction(writ, COUNTERPARTY_A, 500n, IntentClass.TRANSFER);
 
     expect(reason).toBe(REASON.WINDOW);
   });
 
-  it('rejects an intent bit that the action mask does not carry', () => {
-    const writ = sim.issueWrit(BigInt(NOW + 7200));
+  it('rejects an intent the sealed action mask does not carry', async () => {
+    // This mandate permits transfer, swap and contract call, but not data access.
+    sim = await withTerms({ actionMask: 0b0111 });
+    const writ = await sim.issueWrit(BigInt(NOW + 7200));
 
-    const reason = sim.checkAction(writ, COUNTERPARTY_A, 500n, 0b10000n);
+    const reason = await sim.checkAction(writ, COUNTERPARTY_A, 500n, IntentClass.DATA_ACCESS);
 
     expect(reason).toBe(REASON.INTENT);
   });
 
-  it('rejects any action once the writ has been revoked', () => {
-    const writ = sim.issueWrit(BigInt(NOW + 7200));
-    sim.revoke(writ);
+  it('rejects any action once the writ has been revoked', async () => {
+    sim = await withTerms();
+    const writ = await sim.issueWrit(BigInt(NOW + 7200));
+    await sim.revoke(writ);
 
-    const reason = sim.checkAction(writ, COUNTERPARTY_A, 500n, 1n);
+    const reason = await sim.checkAction(writ, COUNTERPARTY_A, 500n, IntentClass.TRANSFER);
 
     expect(reason).toBe(REASON.WRIT_INACTIVE);
   });
 
-  it('records a distinct action for every attempt', () => {
-    const writ = sim.issueWrit(BigInt(NOW + 7200));
+  it('records a distinct action for every attempt', async () => {
+    sim = await withTerms();
+    const writ = await sim.issueWrit(BigInt(NOW + 7200));
 
-    sim.checkAction(writ, COUNTERPARTY_A, 100n, 1n);
-    sim.checkAction(writ, COUNTERPARTY_B, 200n, 2n);
+    await sim.checkAction(writ, COUNTERPARTY_A, 100n, IntentClass.TRANSFER);
+    await sim.checkAction(writ, COUNTERPARTY_B, 200n, IntentClass.SWAP);
+
     const ledger = sim.getLedger();
-
-    expect(ledger.actionWrits.size()).toBe(2);
-    expect(ledger.actionVerdicts.size()).toBe(2);
+    expect(ledger.actionWrits.size()).toBe(2n);
+    expect(ledger.actionVerdicts.size()).toBe(2n);
   });
 
-  it('lets an agent act under the sealed terms without changing them', () => {
-    const writ = sim.issueWrit(BigInt(NOW + 7200));
+  it('accepts an action from the agent registered at issuance', async () => {
+    sim = await withTerms();
+    const writ = await sim.issueWrit(BigInt(NOW + 7200));
 
-    // The agent proves with its own keys while carrying the sealed terms across.
-    sim.switchIdentity(testIdentity('agent'), terms());
-    const reason = sim.checkAction(writ, COUNTERPARTY_A, 500n, 1n);
+    // Acting keeps the registered agent key. Only the agent key matters here,
+    // which is the point of registering it.
+    const reason = await sim.checkAction(writ, COUNTERPARTY_A, 500n, IntentClass.TRANSFER);
 
     expect(reason).toBe(REASON.IN_SCOPE);
+  });
+
+  it('refuses an agent that was not registered at issuance', async () => {
+    sim = await withTerms();
+    const writ = await sim.issueWrit(BigInt(NOW + 7200));
+
+    // A stranger holds the writ id and the terms, but is not the registered agent.
+    sim.switchIdentity(testIdentity('stranger'), terms());
+
+    await expect(
+      sim.checkAction(writ, COUNTERPARTY_A, 500n, IntentClass.TRANSFER),
+    ).rejects.toThrow(/not authorised/);
   });
 });

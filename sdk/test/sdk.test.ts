@@ -55,7 +55,7 @@ const terms: WritTerms = {
 class RecordingTransport implements WritTransport {
   readonly calls: Array<{ method: string; payload: unknown }> = [];
   reason: bigint = BigInt(ReasonCode.IN_SCOPE);
-  fact = 'within-writ';
+  fact = 0n;
 
   async submitIssueWrit(input: { expiry: number }): Promise<Uint8Array> {
     this.calls.push({ method: 'submitIssueWrit', payload: input });
@@ -72,7 +72,7 @@ class RecordingTransport implements WritTransport {
     return { reason: this.reason, actionId: reference('action-id') };
   }
 
-  async submitAttest(input: { actionId: Uint8Array; level: DisclosureLevel }): Promise<string> {
+  async submitAttest(input: { actionId: Uint8Array; level: DisclosureLevel }): Promise<bigint> {
     this.calls.push({ method: 'submitAttest', payload: input });
     return this.fact;
   }
@@ -394,7 +394,7 @@ describe('act', () => {
 describe('attest', () => {
   it('returns exactly one fact', async () => {
     const transport = new RecordingTransport();
-    transport.fact = 'tier-2';
+    transport.fact = 4n;
 
     const disclosure = await createWrit(transport).attest({
       action: reference('action'),

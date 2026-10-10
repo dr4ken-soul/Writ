@@ -21,16 +21,18 @@ it with a dedicated signing key, with no change at the call sites.
   a mask
 - one cross-checks the bundled SHA-256 against the platform implementation across block boundaries
 
-**The contracts.** Two Compact sources against language version 0.23, matching the official
-`midnightntwrk/example-bboard` and `midnight-examples/private-bid` references. `WritRegistry`
-carries the commitment, status, expiry, principal reference and disclosure level in public state,
-and keeps the ceiling, window, allowlist and action mask in witness-held private state. Every
-circuit documents what it must never disclose. `AuditLog` is a standalone append-only accumulator.
+**The contracts.** Two Compact sources at `pragma language_version 0.27.0`, **compiled with
+`compact 0.5.3`**: 8 circuits in WritRegistry, 4 in AuditLog, with provers and verifiers
+generated. `WritRegistry` carries the commitment, status, expiry, principal reference, disclosure
+level and authorised agent in public state, and keeps the ceiling, window, allowlist and permits
+in witness-held private state. Every circuit documents what it must never disclose. `AuditLog` is
+a standalone append-only accumulator.
 
-**The test suites.** Three files against a local circuit simulator, so they need no devnet:
+**The test suites.** Three files against a local circuit simulator, so they need no devnet.
+**23 tests, all passing.**
 
 - `scope.test.ts`: an in-scope action returns 0; amount, recipient, window and intent each return
-  their own reason code; a revoked writ rejects everything
+  their own reason code; a revoked writ rejects everything; an unregistered agent is refused
 - `disclosure.test.ts`: level 1 returns one fact, level 2 returns a band, a level above the
   issuance-time ceiling reverts, and a revert does not advance the audit root
 - `privacy.test.ts`: issues a writ with a ceiling of `987654321`, acts, attests, then walks every
@@ -48,24 +50,9 @@ All six routes build clean and the site was verified in a browser.
 
 ## Not completed, and why
 
-**The contracts have not been compiled.** This is the buildathon's technical gate and it is
-outstanding. Three environment facts caused it:
-
-1. The Compact compiler at `compact-v0.5.3` publishes `apple-darwin` and `aarch64-linux-musl`
-   artefacts. There is no Windows target.
-2. No container runtime was installed, so `midnightntwrk/midnight-local-dev` could not be started.
-3. No Midnight wallet was available.
-
-The sources were written against the current official references and each circuit carries a
-disclosure contract, but "written against the reference" is not "compiles", and the README says so
-in those words. The first action for anyone picking this up is `cd contracts && npm run compact` on
-Linux or macOS.
-
-**The contract test suites have therefore not been executed.** They are written against the
-generated managed contract, so they cannot run before compilation succeeds.
-
-**No deployment.** With no compiler, no node and no wallet, there are no contract addresses, so
-`NEXT_PUBLIC_WRIT_REGISTRY_ADDRESS` is unset.
+**No deployment.** The contracts compile and all 23 tests pass against the compiled circuit in
+process, but nothing has been deployed to a network. That needs a running node and a funded
+Midnight wallet, neither of which existed on the build machine.
 
 **The consequence for the frontend was handled rather than hidden.** Every screen that needs a
 contract read renders an explicit "no deployment configured" state naming the variable to set. The
@@ -86,15 +73,19 @@ called by a verifier who does not hold the principal's private state, so the cir
 level to enforce the ceiling without co-signing every disclosure. The level reveals how much may
 be disclosed, never what the terms are. Reasoning in `docs/ARCHITECTURE.md`.
 
-**The two contracts are not linked by a cross-contract call.** Cross-contract imports would make
-the compiling claim depend on harder-to-verify syntax than the logic it saves.
+**The agent is bound at issuance.** `sealedAgentKey` is registered during `issueWrit` and
+`checkAction` refuses any transaction from an unregistered agent. Without it, anyone holding a
+writ id could submit an action and flip that writ's public status.
 
-**Principal and agent share private state in the MVP.** On Midnight private state is wallet
-scoped, so an action can only be checked in-circuit against terms present in the proving wallet's
-private state. The MVP runs both under one private state. This does preserve every publicly
-verifiable guarantee, but it does mean the agent can read the terms, and a delegated-prover flow
-is needed to close that. Stated plainly in `docs/ARCHITECTURE.md` rather than left for a judge to
-find.
+**The agent still shares private state with the principal in the MVP.** On Midnight private state
+is wallet scoped, so an action can only be checked in-circuit against terms present in the proving
+wallet's private state. This preserves every publicly verifiable guarantee, but the agent can read
+its own terms. `sealedAgentKey` is the seam a delegated-prover build would use. Stated plainly in
+`docs/ARCHITECTURE.md`.
+
+**The contract returns a disclosure code, not a string.** Compact cannot construct an
+`Opaque<"string">` in-circuit, so `attest` returns one code from a fixed six value set and the SDK
+renders the fact. The circuit still decides which code, and the level is still gated in-circuit.
 
 **A deterministic clock seam.** `currentTimestamp` reads the host clock, with `setTestClock` for the
 suites to pin time. It lives in the witness layer, never in the circuit, so a caller cannot talk
@@ -102,11 +93,21 @@ its way past a sealed window by passing a timestamp of its own.
 
 ---
 
+## What the compiler forced
+
+Three language facts changed the implementation, and each is documented in
+`docs/ARCHITECTURE.md`:
+
+- Compact has **no bitwise operators**, so the action mask became an `IntentClass` enum plus a
+  `Vector<4, Boolean>` of permits
+- Compact has **no division operator**, so the spend bands are expressed as multiplications
+- `var` is **reserved**, so the allowlist check is unrolled across its eight fixed slots
+
+---
+
 ## Next steps, in order
 
-1. `cd contracts && npm run compact`, fix whatever the compiler reports, and land the gate
-2. `cd contracts && npm test`, and get the three suites green
-3. Start `midnight-local-dev`, deploy both contracts, record the addresses
-4. Fill in `.env.local`, then exercise the full flow end to end against the deployment
-5. Record the demo video
-6. Deploy the preview to Vercel and run the deep-link acceptance tests from `FRONTEND_SPEC.md`
+1. Start `midnight-local-dev`, deploy both contracts, record the addresses
+2. Fill in `.env.local`, then exercise the full flow end to end against the deployment
+3. Record the demo video
+4. Deploy the preview to Vercel and run the deep-link acceptance tests from `FRONTEND_SPEC.md`

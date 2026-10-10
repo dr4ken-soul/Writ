@@ -32,6 +32,30 @@ export const DISCLOSED_FACTS = Object.freeze({
 } as const);
 
 /**
+ * The disclosure codes the contract returns, in the order it returns them.
+ *
+ * Compact cannot build an opaque string in-circuit, so the contract picks a code
+ * from this fixed set and the SDK renders the fact. The circuit still decides
+ * which code, so the level gate and the one fact per call rule are unaffected.
+ */
+const CODE_TO_FACT = [
+  DISCLOSED_FACTS.WITHIN_WRIT,
+  DISCLOSED_FACTS.REJECTED,
+  DISCLOSED_FACTS.TIER_0,
+  DISCLOSED_FACTS.TIER_1,
+  DISCLOSED_FACTS.TIER_2,
+  DISCLOSED_FACTS.TIER_3,
+] as const;
+
+/**
+ * Renders a disclosure code as the single fact it stands for.
+ * @param code - the value returned by attest
+ * @returns the disclosed fact
+ */
+export const toDisclosedFact = (code: bigint | number): string =>
+  CODE_TO_FACT[Number(code)] ?? DISCLOSED_FACTS.REJECTED;
+
+/**
  * Requests one scoped disclosure about one action.
  *
  * The result is a single string. If the policy fixed at issuance does not
@@ -52,10 +76,10 @@ export const attest = async (
     );
   }
 
-  const fact = await transport.submitAttest({
+  const code = await transport.submitAttest({
     actionId: input.action,
     level: input.level,
   });
 
-  return { actionId: input.action, level: input.level, fact };
+  return { actionId: input.action, level: input.level, fact: toDisclosedFact(code) };
 };

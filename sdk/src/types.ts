@@ -138,11 +138,11 @@ export interface WritTransport {
     readonly amount: bigint;
     readonly intent: number;
   }): Promise<{ readonly reason: bigint; readonly actionId: Uint8Array }>;
-  /** Calls `attest`. Resolves to the single disclosed fact. */
+  /** Calls `attest`. Resolves to the disclosure code the circuit chose. */
   submitAttest(input: {
     readonly actionId: Uint8Array;
     readonly level: DisclosureLevel;
-  }): Promise<string>;
+  }): Promise<bigint>;
   /** Calls `revoke`. */
   submitRevoke(input: { readonly writId: Uint8Array }): Promise<void>;
   /** Calls `statusOf`. Resolves to the commitment. */
