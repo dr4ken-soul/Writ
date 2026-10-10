@@ -19,7 +19,7 @@
   ],
   "scripts": {
     "compact": "compact compile src/WritRegistry.compact ./src/managed/writ-registry && compact compile src/AuditLog.compact ./src/managed/audit-log",
-    "build": "rm -rf dist && tsc --project tsconfig.build.json && cp -Rf ./src/managed ./dist/managed && cp ./src/*.compact ./dist",
+    "build": "tsc --project tsconfig.build.json && cp -Rf ./src/managed ./dist/managed && cp ./src/*.compact ./dist",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint": "eslint src test",
     "test": "vitest run",

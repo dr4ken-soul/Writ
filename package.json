@@ -1,0 +1,16 @@
+{
+  "name": "writ",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Writ: a private mandate layer for AI agents on Midnight",
+  "license": "Apache-2.0",
+  "workspaces": [
+    "sdk",
+    "web"
+  ],
+  "scripts": {
+    "build:sdk": "npm run build --workspace @writ/sdk",
+    "build:web": "npm run build --workspace writ-web",
+    "test:sdk": "npm run test --workspace @writ/sdk"
+  }
+}

@@ -1,5 +1,5 @@
 {
-  "name": "web",
+  "name": "writ-web",
   "version": "0.1.0",
   "private": true,
   "scripts": {
@@ -9,7 +9,7 @@
     "lint": "next lint"
   },
   "dependencies": {
-    "@writ/sdk": "file:../sdk",
+    "@writ/sdk": "*",
     "lucide-react": "^1.55.0",
     "motion": "^14.1.0",
     "next": "14.2.35",
