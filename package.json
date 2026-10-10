@@ -12,5 +12,8 @@
     "build:sdk": "npm run build --workspace @writ/sdk",
     "build:web": "npm run build --workspace writ-web",
     "test:sdk": "npm run test --workspace @writ/sdk"
+  },
+  "devDependencies": {
+    "next": "14.2.35"
   }
 }

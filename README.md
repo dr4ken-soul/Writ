@@ -11,6 +11,8 @@ contract-controlled disclosure, and every disclosure lands in an append-only aud
 
 Built for the Midnight Buildathon on AKINDO.
 
+**Live preview:** https://writ-mandates-gsijs0f4r-psycho-projects.vercel.app
+
 ---
 
 ## Status of this build
